@@ -15,6 +15,7 @@ const app = express()
 const port = Number(process.env.PORT || 4000)
 const roles = ['admin', 'teacher', 'student']
 const serverDirectory = path.dirname(fileURLToPath(import.meta.url))
+let databaseInitialization
 
 app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173' }))
 app.use(helmet())
@@ -23,6 +24,15 @@ if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1)
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false }))
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }))
+
+app.use(async (_req, _res, next) => {
+  try {
+    await initializeDatabase()
+    next()
+  } catch (error) {
+    next(error)
+  }
+})
 
 app.post('/api/auth/register', async (req, res, next) => {
   try {
@@ -478,7 +488,7 @@ app.get('/api/quizzes/:id/analytics', authenticate, allow('teacher', 'admin'), a
 
 app.use('/api', (_req, res) => res.status(404).json({ message: 'API endpoint not found.' }))
 
-if (process.env.NODE_ENV === 'production') {
+if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
   const buildDirectory = path.resolve(serverDirectory, '../dist')
   app.use(express.static(buildDirectory))
   app.get(/.*/, (_req, res, next) => {
@@ -612,27 +622,46 @@ function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-async function start() {
+async function initializeDatabase() {
+  if (mongoose.connection.readyState === 1) return
   if (!process.env.MONGODB_URI || !process.env.JWT_SECRET) {
     throw new Error('MONGODB_URI and JWT_SECRET must be configured before starting the API.')
   }
-  await mongoose.connect(process.env.MONGODB_URI)
-  if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
-    const email = process.env.ADMIN_EMAIL.trim().toLowerCase()
-    if (!await User.exists({ email })) {
-      await User.create({
-        name: process.env.ADMIN_NAME || 'System Admin',
-        email,
-        passwordHash: await bcrypt.hash(process.env.ADMIN_PASSWORD, 12),
-        role: 'admin',
-      })
-      console.log(`Initial admin account created: ${email}`)
-    }
+  if (!databaseInitialization) {
+    databaseInitialization = (async () => {
+      await mongoose.connect(process.env.MONGODB_URI)
+      if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
+        const email = process.env.ADMIN_EMAIL.trim().toLowerCase()
+        if (!await User.exists({ email })) {
+          await User.create({
+            name: process.env.ADMIN_NAME || 'System Admin',
+            email,
+            passwordHash: await bcrypt.hash(process.env.ADMIN_PASSWORD, 12),
+            role: 'admin',
+          })
+          console.log(`Initial admin account created: ${email}`)
+        }
+      }
+    })()
   }
+  try {
+    await databaseInitialization
+  } catch (error) {
+    databaseInitialization = undefined
+    throw error
+  }
+}
+
+async function start() {
+  await initializeDatabase()
   app.listen(port, () => console.log(`Quiz app API listening on http://localhost:${port}`))
 }
 
-start().catch(error => {
-  console.error('Unable to start the API:', error)
-  process.exitCode = 1
-})
+if (!process.env.VERCEL) {
+  start().catch(error => {
+    console.error('Unable to start the API:', error)
+    process.exitCode = 1
+  })
+}
+
+export default app

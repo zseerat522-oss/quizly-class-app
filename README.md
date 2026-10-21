@@ -68,6 +68,8 @@ The API health endpoint is `http://localhost:4000/api/health`.
 
 `render.yaml` is a Render Blueprint for a single web service that builds the React application and serves it from Express. `Dockerfile` and `docker-compose.yml` are provided for container-based hosting and local development.
 
+The app can also be deployed to Vercel's free Hobby plan for a class or personal project. The Vite frontend is served as static output and `api/index.js` routes API requests to the Express application. Import the GitHub repository into Vercel; `vercel.json` supplies the build, output and routing configuration. Configure `MONGODB_URI`, `JWT_SECRET`, `ADMIN_NAME`, `ADMIN_EMAIL` and `ADMIN_PASSWORD` in the Vercel project environment settings. Use a MongoDB Atlas database user created for this app, and allow database access from the deployed service's outbound IP ranges where possible.
+
 To deploy:
 
 1. Create a MongoDB Atlas cluster and database user. Allow network access only from your hosting provider where possible; use TLS and a least-privilege database user.
