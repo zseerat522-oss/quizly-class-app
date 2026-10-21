@@ -7,11 +7,35 @@ import './App.css'
 type View = 'overview' | 'quizzes' | 'results' | 'people' | 'subjects' | 'question-bank' | 'assignments' | 'battles' | 'leaderboard'
 type QuizSession = { attempt: Attempt; quiz: Quiz }
 type GeneratedQuestion = Omit<BankQuestion, '_id' | 'subjectId'>
+type InstallPromptEvent = Event & {
+  prompt: () => Promise<void>
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
+}
 
 function App() {
   const [user, setUser] = useState<User | null>(null)
   const [checkingSession, setCheckingSession] = useState(Boolean(localStorage.getItem('quiz-token')))
   const [authError, setAuthError] = useState('')
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null)
+  const [isInstalled, setIsInstalled] = useState(() => window.matchMedia('(display-mode: standalone)').matches
+    || (navigator as Navigator & { standalone?: boolean }).standalone === true)
+
+  useEffect(() => {
+    const handleInstallAvailable = (event: Event) => {
+      event.preventDefault()
+      setInstallPrompt(event as InstallPromptEvent)
+    }
+    const handleInstalled = () => {
+      setInstallPrompt(null)
+      setIsInstalled(true)
+    }
+    window.addEventListener('beforeinstallprompt', handleInstallAvailable)
+    window.addEventListener('appinstalled', handleInstalled)
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleInstallAvailable)
+      window.removeEventListener('appinstalled', handleInstalled)
+    }
+  }, [])
 
   useEffect(() => {
     if (!localStorage.getItem('quiz-token')) return
@@ -41,9 +65,17 @@ function App() {
     setUser(null)
   }
 
+  async function installApp() {
+    if (!installPrompt) return false
+    await installPrompt.prompt()
+    await installPrompt.userChoice
+    setInstallPrompt(null)
+    return true
+  }
+
   if (checkingSession) return <div className="page-loader"><span className="spinner" /> Loading your workspace</div>
   if (!user) return <LoginScreen onSubmit={signIn} error={authError} />
-  return <Workspace user={user} onSignOut={signOut} />
+  return <Workspace user={user} onSignOut={signOut} isInstalled={isInstalled} onInstallApp={installApp} />
 }
 
 function LoginScreen({ onSubmit, error }: {
@@ -107,7 +139,12 @@ function LoginScreen({ onSubmit, error }: {
   )
 }
 
-function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
+function Workspace({ user, onSignOut, isInstalled, onInstallApp }: {
+  user: User
+  onSignOut: () => void
+  isInstalled: boolean
+  onInstallApp: () => Promise<boolean>
+}) {
   const [view, setView] = useState<View>('overview')
   const [quizzes, setQuizzes] = useState<Quiz[]>([])
   const [subjects, setSubjects] = useState<Subject[]>([])
@@ -179,6 +216,18 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
     }
   }
 
+  async function requestInstall() {
+    try {
+      if (await onInstallApp()) return
+      const isAppleMobile = /iPhone|iPad|iPod/i.test(navigator.userAgent)
+      setNotice(isAppleMobile
+        ? 'To install Quizly, tap Share in Safari, then choose Add to Home Screen.'
+        : 'To install Quizly, open your browser menu and choose Install app or Add to Home screen.')
+    } catch (cause) {
+      setError(getError(cause))
+    }
+  }
+
   if (session) return <QuizRunner session={session} onExit={() => setSession(null)} onSubmit={finishQuiz} />
 
   return (
@@ -197,7 +246,7 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
       <main className="main-area">
         <header className="topbar">
           <div className="breadcrumb">Workspace <span>/</span> <strong>{navItems.find(item => item.id === view)?.label}</strong></div>
-          <div className="topbar-actions"><span className="today">{new Intl.DateTimeFormat('en', { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date())}</span><div className="user-avatar small">{initials(user.name)}</div></div>
+          <div className="topbar-actions">{!isInstalled && <button className="button button-ghost install-button" onClick={() => void requestInstall()}>↓ Install</button>}<span className="today">{new Intl.DateTimeFormat('en', { weekday: 'short', month: 'short', day: 'numeric' }).format(new Date())}</span><div className="user-avatar small">{initials(user.name)}</div></div>
         </header>
         <div className="content-wrap">
           {notice && <div className="toast success-toast">{notice}<button onClick={() => setNotice('')}>×</button></div>}

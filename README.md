@@ -2,6 +2,8 @@
 
 A responsive full-stack assessment platform built with React, TypeScript, Express, Node.js and MongoDB. It includes role-specific administrator, teacher and student workspaces, server-graded quiz attempts, a reusable question bank, reporting and production deployment configuration.
 
+Quizly can be installed from a supported mobile or desktop browser as a Progressive Web App (PWA). On Android/Chrome, use the Install button in the app or the browser menu; on iPhone/iPad, open the site in Safari and choose Share → Add to Home Screen. The app shell and previously loaded static assets can be available offline, but signing in, quizzes, battles, assignments and other data features require an internet connection.
+
 ## Features
 
 ### Administrator
