@@ -11,6 +11,21 @@ A responsive full-stack assessment platform built with React, TypeScript, Expres
 - Manage the academic subject catalog.
 - Monitor all quizzes and review/export student results.
 
+### Assignments
+
+- Teachers create subject assignments with instructions, due dates and a maximum mark.
+- Students submit PDF or JPG files up to 5 MB before the deadline and can replace them until a teacher reviews them.
+- Teachers download submissions, grade them and leave feedback; students see the grade and feedback after review.
+- Submission files are stored in the private MongoDB database and can only be downloaded by the student who submitted them or the assignment's teacher.
+
+### Quiz battles and weekly leaderboard
+
+- Teachers or students can create a quiz battle using a published quiz, selecting two individual students or two teams of 2–5 students.
+- All selected students must mark themselves ready before the shared quiz timer begins. Each side gets one answer per question; the first correct answer earns a point. The highest score wins.
+- Battle questions are snapshotted when the battle is created, and correct answers are never sent to clients.
+- Students can view the weekly leaderboard for all active student accounts. It uses each student's best percentage per quiz during the current Asia/Karachi week, then averages those percentages. Ties share a rank; students without completed quizzes appear without a rank. Individual quiz marks are not shown.
+- The weekly ranking resets at Monday 12:00 AM Asia/Karachi time.
+
 ### Teacher
 
 - Create, edit and publish quizzes; keep work as drafts.
@@ -69,6 +84,8 @@ The API health endpoint is `http://localhost:4000/api/health`.
 `render.yaml` is a Render Blueprint for a single web service that builds the React application and serves it from Express. `Dockerfile` and `docker-compose.yml` are provided for container-based hosting and local development.
 
 The app can also be deployed to Vercel's free Hobby plan for a class or personal project. The Vite frontend is served as static output and `api/index.js` routes API requests to the Express application. Import the GitHub repository into Vercel; `vercel.json` supplies the build, output and routing configuration. Configure `MONGODB_URI`, `JWT_SECRET`, `ADMIN_NAME`, `ADMIN_EMAIL` and `ADMIN_PASSWORD` in the Vercel project environment settings. Use a MongoDB Atlas database user created for this app, and allow database access from the deployed service's outbound IP ranges where possible.
+
+Teachers can optionally generate question-bank drafts with Gemini. Configure `GEMINI_API_KEY` as a server-side environment variable in Vercel (and locally in `.env`) to enable it. Keep the key private; generated questions must be reviewed by the teacher before they are saved. The generation endpoint limits requests and creates drafts only.
 
 To deploy:
 

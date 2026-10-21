@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
-import { api, getError } from './api'
-import type { Attempt, BankQuestion, Question, Quiz, Role, Subject, User } from './api'
+import { api, downloadAuthenticatedFile, getError } from './api'
+import type { Assignment, AssignmentSubmission, Attempt, BankQuestion, Question, Quiz, QuizBattle, Role, Subject, User, WeeklyLeaderboard } from './api'
 import './App.css'
 
-type View = 'overview' | 'quizzes' | 'results' | 'people' | 'subjects' | 'question-bank'
+type View = 'overview' | 'quizzes' | 'results' | 'people' | 'subjects' | 'question-bank' | 'assignments' | 'battles' | 'leaderboard'
 type QuizSession = { attempt: Attempt; quiz: Quiz }
+type GeneratedQuestion = Omit<BankQuestion, '_id' | 'subjectId'>
 
 function App() {
   const [user, setUser] = useState<User | null>(null)
@@ -150,8 +151,8 @@ function Workspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   const navItems: { id: View; label: string; icon: string }[] = user.role === 'admin'
     ? [{ id: 'overview', label: 'Overview', icon: '◫' }, { id: 'people', label: 'People', icon: '♙' }, { id: 'subjects', label: 'Subjects', icon: '▤' }, { id: 'quizzes', label: 'All quizzes', icon: '☷' }, { id: 'results', label: 'Results & reports', icon: '▥' }]
     : user.role === 'teacher'
-      ? [{ id: 'overview', label: 'Overview', icon: '◫' }, { id: 'quizzes', label: 'My quizzes', icon: '☷' }, { id: 'question-bank', label: 'Question bank', icon: '▤' }, { id: 'results', label: 'Class results', icon: '▥' }]
-      : [{ id: 'overview', label: 'Overview', icon: '◫' }, { id: 'quizzes', label: 'Explore quizzes', icon: '☷' }, { id: 'results', label: 'My results', icon: '▥' }]
+      ? [{ id: 'overview', label: 'Overview', icon: '◫' }, { id: 'quizzes', label: 'My quizzes', icon: '☷' }, { id: 'assignments', label: 'Assignments', icon: '✎' }, { id: 'battles', label: 'Quiz battle', icon: '⚔' }, { id: 'question-bank', label: 'Question bank', icon: '▤' }, { id: 'results', label: 'Class results', icon: '▥' }]
+      : [{ id: 'overview', label: 'Overview', icon: '◫' }, { id: 'quizzes', label: 'Explore quizzes', icon: '☷' }, { id: 'assignments', label: 'Assignments', icon: '✎' }, { id: 'battles', label: 'Quiz battle', icon: '⚔' }, { id: 'leaderboard', label: 'Weekly ranking', icon: '♛' }, { id: 'results', label: 'My results', icon: '▥' }]
 
   async function startQuiz(quizId: string) {
     setError('')
@@ -239,6 +240,9 @@ function PageContent(props: {
   if (view === 'people') return <PeoplePage {...props} />
   if (view === 'subjects') return <SubjectsPage {...props} />
   if (view === 'question-bank') return <QuestionBankPage {...props} />
+  if (view === 'assignments') return <AssignmentsPage {...props} />
+  if (view === 'battles') return <QuizBattlePage {...props} />
+  if (view === 'leaderboard') return <WeeklyLeaderboardPage {...props} />
   if (view === 'quizzes') return user.role === 'teacher' ? <TeacherQuizzes {...props} /> : user.role === 'admin' ? <AdminQuizzes {...props} /> : <QuizCatalog {...props} />
   if (view === 'results') return user.role === 'teacher' ? <TeacherResults {...props} /> : user.role === 'admin' ? <AdminResults {...props} /> : <StudentResults {...props} />
   return <Overview {...props} />
@@ -534,12 +538,17 @@ function QuestionBankPage({ subjects, onNotice, onError }: Parameters<typeof Pag
   const [questions, setQuestions] = useState<BankQuestion[]>([])
   const [editing, setEditing] = useState<BankQuestion | null>(null)
   const [busy, setBusy] = useState(false)
+  const [generating, setGenerating] = useState(false)
   const [difficultyFilter, setDifficultyFilter] = useState('all')
   const [subjectFilter, setSubjectFilter] = useState('all')
   const [questionType, setQuestionType] = useState<'multiple-choice' | 'true-false'>('multiple-choice')
   const [options, setOptions] = useState(['', '', '', ''])
   const [correctOption, setCorrectOption] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [generatedQuestions, setGeneratedQuestions] = useState<GeneratedQuestion[]>([])
+  const [generatedSubjectId, setGeneratedSubjectId] = useState('')
+  const [questionFormDefaults, setQuestionFormDefaults] = useState<Pick<GeneratedQuestion, 'prompt' | 'topic' | 'difficulty'> & { subjectId: string } | null>(null)
+  const [questionFormVersion, setQuestionFormVersion] = useState(0)
 
   const refresh = useCallback(async () => {
     try {
@@ -574,6 +583,8 @@ function QuestionBankPage({ subjects, onNotice, onError }: Parameters<typeof Pag
       setOptions(['', '', '', ''])
       setCorrectOption(0)
       setEditing(null)
+      setQuestionFormDefaults(null)
+      setQuestionFormVersion(version => version + 1)
       await refresh()
       onNotice(editing ? 'Question changes saved.' : 'Question added to your bank.')
     } catch (error) {
@@ -581,6 +592,46 @@ function QuestionBankPage({ subjects, onNotice, onError }: Parameters<typeof Pag
     } finally {
       setBusy(false)
     }
+  }
+
+  async function generateQuestions(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const subjectId = String(form.get('subjectId'))
+    setGenerating(true)
+    try {
+      const result = await api<{ questions: GeneratedQuestion[] }>('/ai/generate-questions', {
+        method: 'POST',
+        body: JSON.stringify({
+          subjectId,
+          topic: form.get('topic'),
+          difficulty: form.get('difficulty'),
+          questionType: form.get('questionType'),
+          count: Number(form.get('count')),
+        }),
+      })
+      setGeneratedQuestions(result.questions)
+      setGeneratedSubjectId(subjectId)
+      onNotice(`${result.questions.length} AI question drafts generated. Review them before saving.`)
+    } catch (error) {
+      onError(getError(error))
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  function editGeneratedQuestion(question: GeneratedQuestion) {
+    setEditing(null)
+    setQuestionType(question.questionType)
+    setOptions([...question.options])
+    setCorrectOption(question.correctOption)
+    setQuestionFormDefaults({
+      prompt: question.prompt,
+      topic: question.topic,
+      difficulty: question.difficulty,
+      subjectId: generatedSubjectId,
+    })
+    setQuestionFormVersion(version => version + 1)
   }
 
   async function removeQuestion(question: BankQuestion) {
@@ -601,13 +652,33 @@ function QuestionBankPage({ subjects, onNotice, onError }: Parameters<typeof Pag
 
   return <>
     <PageHeading eyebrow="REUSABLE CONTENT" title="Question bank" description="Organize reusable questions by subject, topic and difficulty." />
+    <section className="ai-generator-panel">
+      <div className="form-section-title"><span>✦</span><div><h3>Generate questions with AI</h3><p>Create editable drafts with Gemini. Check every answer before adding it to your bank.</p></div></div>
+      <form className="ai-generator-form" onSubmit={generateQuestions}>
+        <label>Subject<select name="subjectId" required defaultValue=""><option value="" disabled>Select a subject</option>{subjects.map(subject => <option key={subject._id} value={subject._id}>{subject.name}</option>)}</select></label>
+        <label>Topic<input name="topic" maxLength={120} placeholder="e.g. Cell structure" /></label>
+        <label>Difficulty<select name="difficulty" defaultValue="medium"><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
+        <label>Question type<select name="questionType" defaultValue="multiple-choice"><option value="multiple-choice">Multiple choice</option><option value="true-false">True / False</option></select></label>
+        <label>Number<select name="count" defaultValue="3"><option value="1">1 question</option><option value="3">3 questions</option><option value="5">5 questions</option></select></label>
+        <button className="button button-primary" disabled={generating || !subjects.length}>{generating ? 'Generating…' : '✦ Generate drafts'}</button>
+      </form>
+      {generatedQuestions.length > 0 && <div className="ai-draft-list">
+        <div className="table-heading"><div><h3>Review generated drafts</h3><p>AI can make mistakes. Edit or discard a draft before saving it.</p></div><button className="table-link" onClick={() => setGeneratedQuestions([])}>Clear drafts</button></div>
+        {generatedQuestions.map((question, index) => <article className="bank-question ai-draft" key={`${index}-${question.prompt}`}>
+          <div className="bank-question-head"><div className="bank-tags"><span className={`difficulty-tag ${question.difficulty}`}>{capitalize(question.difficulty)}</span><span className="type-tag">{question.questionType === 'true-false' ? 'True / False' : 'Multiple choice'}</span></div><button className="table-link" onClick={() => editGeneratedQuestion(question)}>Edit & review</button></div>
+          <h4>{question.prompt}</h4>
+          <div className="bank-answer-options">{question.options.map((option, optionIndex) => <span className={optionIndex === question.correctOption ? 'bank-answer correct' : 'bank-answer'} key={`${optionIndex}-${option}`}>{String.fromCharCode(65 + optionIndex)}. {option}{optionIndex === question.correctOption && ' ✓'}</span>)}</div>
+          {question.topic && <small className="bank-topic">{question.topic}</small>}
+        </article>)}
+      </div>}
+    </section>
     <div className="bank-layout">
-      <form className="subject-form bank-form" key={editing?._id || 'new-question'} onSubmit={addQuestion}>
+      <form className="subject-form bank-form" key={`${editing?._id || 'new-question'}-${questionFormVersion}`} onSubmit={addQuestion}>
         <div className="form-section-title"><span>{editing ? '✎' : '＋'}</span><div><h3>{editing ? 'Edit question' : 'Add a question'}</h3><p>Save an item for future quizzes.</p></div></div>
-        <label>Question<textarea name="prompt" rows={3} required defaultValue={editing?.prompt} placeholder="Write a clear question…" /></label>
-        <label>Subject<select name="subjectId" required defaultValue={editing?.subjectId?._id || ''}><option value="" disabled>Select a subject</option>{subjects.map(subject => <option key={subject._id} value={subject._id}>{subject.name}</option>)}</select></label>
-        <label>Topic<input name="topic" defaultValue={editing?.topic} placeholder="e.g. Cell structure" /></label>
-        <label>Difficulty<select name="difficulty" defaultValue={editing?.difficulty || 'medium'}><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
+        <label>Question<textarea name="prompt" rows={3} required defaultValue={editing?.prompt || questionFormDefaults?.prompt} placeholder="Write a clear question…" /></label>
+        <label>Subject<select name="subjectId" required defaultValue={editing?.subjectId?._id || questionFormDefaults?.subjectId || ''}><option value="" disabled>Select a subject</option>{subjects.map(subject => <option key={subject._id} value={subject._id}>{subject.name}</option>)}</select></label>
+        <label>Topic<input name="topic" defaultValue={editing?.topic || questionFormDefaults?.topic} placeholder="e.g. Cell structure" /></label>
+        <label>Difficulty<select name="difficulty" defaultValue={editing?.difficulty || questionFormDefaults?.difficulty || 'medium'}><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label>
         <label>Type<select value={questionType} onChange={event => { const next = event.target.value as typeof questionType; setQuestionType(next); setOptions(next === 'true-false' ? ['True', 'False'] : ['', '', '', '']); setCorrectOption(0) }}><option value="multiple-choice">Multiple choice</option><option value="true-false">True / False</option></select></label>
         <div className="bank-options"><span>Answer options <small>Select the correct answer</small></span>{options.map((option, index) => <label className={correctOption === index ? 'option-edit correct' : 'option-edit'} key={index}><input type="radio" name="bank-correct-option" checked={correctOption === index} onChange={() => setCorrectOption(index)} aria-label={`Mark option ${index + 1} correct`} /><span>{String.fromCharCode(65 + index)}</span><input value={option} onChange={event => setOptions(current => current.map((value, i) => i === index ? event.target.value : value))} placeholder={`Option ${index + 1}`} required /></label>)}</div>
         <div className="bank-form-actions"><button className="button button-primary" disabled={busy || !subjects.length}>{busy ? 'Saving…' : editing ? 'Save changes' : 'Save question'}</button>{editing && <button type="button" className="button button-ghost" onClick={() => { setEditing(null); setQuestionType('multiple-choice'); setOptions(['', '', '', '']); setCorrectOption(0) }}>Cancel</button>}</div>
@@ -617,6 +688,439 @@ function QuestionBankPage({ subjects, onNotice, onError }: Parameters<typeof Pag
         {loading ? <div className="empty-inline">Loading question bank…</div> : visible.length ? <div className="bank-question-list">{visible.map(question => <article className="bank-question" key={question._id}><div className="bank-question-head"><div className="bank-tags"><span className="subject-pill">{question.subjectId?.code}</span><span className={`difficulty-tag ${question.difficulty}`}>{capitalize(question.difficulty)}</span><span className="type-tag">{question.questionType === 'true-false' ? 'True / False' : 'Multiple choice'}</span></div><div className="bank-actions"><button className="table-link" onClick={() => { setEditing(question); setQuestionType(question.questionType); setOptions([...question.options]); setCorrectOption(question.correctOption) }}>Edit</button><button className="icon-button" title="Delete question" onClick={() => void removeQuestion(question)}>×</button></div></div><h4>{question.prompt}</h4><div className="bank-answer-options">{question.options.map((option, index) => <span className={index === question.correctOption ? 'bank-answer correct' : 'bank-answer'} key={index}>{String.fromCharCode(65 + index)}. {option}{index === question.correctOption && ' ✓'}</span>)}</div>{question.topic && <small className="bank-topic">{question.topic}</small>}</article>)}</div> : <EmptyState title="No saved questions found" text="Add questions here to reuse them in future quizzes." />}
       </div>
     </div>
+  </>
+}
+
+function AssignmentsPage({ user, subjects, onNotice, onError }: Parameters<typeof PageContent>[0]) {
+  const [assignments, setAssignments] = useState<Assignment[]>([])
+  const [selectedAssignmentId, setSelectedAssignmentId] = useState('')
+  const [submissions, setSubmissions] = useState<AssignmentSubmission[]>([])
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [reviewingId, setReviewingId] = useState('')
+
+  const refreshAssignments = useCallback(async () => {
+    try {
+      setAssignments(await api<Assignment[]>('/assignments'))
+    } catch (error) {
+      onError(getError(error))
+    } finally {
+      setLoading(false)
+    }
+  }, [onError])
+
+  useEffect(() => { void refreshAssignments() }, [refreshAssignments])
+
+  useEffect(() => {
+    if (user.role !== 'teacher' || !selectedAssignmentId) return
+    let active = true
+    api<{ submissions: AssignmentSubmission[] }>(`/assignments/${selectedAssignmentId}/submissions`)
+      .then(({ submissions: nextSubmissions }) => { if (active) setSubmissions(nextSubmissions) })
+      .catch(error => { if (active) onError(getError(error)) })
+    return () => { active = false }
+  }, [onError, selectedAssignmentId, user.role])
+
+  async function createAssignment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    setBusy(true)
+    try {
+      await api('/assignments', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: form.get('title'),
+          description: form.get('description'),
+          subjectId: form.get('subjectId'),
+          dueAt: new Date(String(form.get('dueAt'))).toISOString(),
+          maxMarks: Number(form.get('maxMarks')),
+        }),
+      })
+      event.currentTarget.reset()
+      await refreshAssignments()
+      onNotice('Assignment created and added to the selected subject.')
+    } catch (error) {
+      onError(getError(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function submitAssignment(event: FormEvent<HTMLFormElement>, assignment: Assignment) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    const file = form.get('file')
+    if (!(file instanceof File) || !file.size) {
+      onError('Choose a PDF or JPG file first.')
+      return
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      onError('The file must be 5 MB or smaller.')
+      return
+    }
+    const mimeType = file.type || (file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'image/jpeg')
+    if (!['application/pdf', 'image/jpeg'].includes(mimeType)) {
+      onError('Only PDF and JPG files are accepted.')
+      return
+    }
+    setBusy(true)
+    try {
+      await api(`/assignments/${assignment._id}/submissions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': mimeType,
+          'X-File-Name': encodeURIComponent(file.name),
+        },
+        body: file,
+      })
+      event.currentTarget.reset()
+      await refreshAssignments()
+      onNotice('Assignment submitted successfully.')
+    } catch (error) {
+      onError(getError(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function reviewSubmission(event: FormEvent<HTMLFormElement>, assignmentId: string, submissionId: string) {
+    event.preventDefault()
+    const form = new FormData(event.currentTarget)
+    setReviewingId(submissionId)
+    try {
+      await api(`/assignments/${assignmentId}/submissions/${submissionId}/review`, {
+        method: 'PATCH',
+        body: JSON.stringify({ marks: Number(form.get('marks')), feedback: form.get('feedback') }),
+      })
+      const result = await api<{ submissions: AssignmentSubmission[] }>(`/assignments/${assignmentId}/submissions`)
+      setSubmissions(result.submissions)
+      await refreshAssignments()
+      onNotice('Marks and feedback saved. The student can now see the review.')
+    } catch (error) {
+      onError(getError(error))
+    } finally {
+      setReviewingId('')
+    }
+  }
+
+  async function downloadSubmission(assignmentId: string, submission: AssignmentSubmission) {
+    try {
+      await downloadAuthenticatedFile(
+        `/assignments/${assignmentId}/submissions/${submission._id}/file`,
+        submission.fileName,
+      )
+    } catch (error) {
+      onError(getError(error))
+    }
+  }
+
+  if (user.role === 'teacher') {
+    return <>
+      <PageHeading eyebrow="COURSEWORK" title="Assignments" description="Set work for a subject, review student uploads, and return marks with feedback." />
+      <div className="assignment-layout">
+        <form className="subject-form assignment-create-form" onSubmit={createAssignment}>
+          <div className="form-section-title"><span>＋</span><div><h3>Create an assignment</h3><p>Students assigned to the subject will see it.</p></div></div>
+          <label>Title<input name="title" maxLength={160} required placeholder="e.g. Chapter 2 report" /></label>
+          <label>Subject<select name="subjectId" required defaultValue=""><option value="" disabled>Select a subject</option>{subjects.map(subject => <option key={subject._id} value={subject._id}>{subject.name}</option>)}</select></label>
+          <label>Instructions<textarea name="description" rows={3} maxLength={5000} placeholder="Explain what students should submit…" /></label>
+          <label>Due date and time<input name="dueAt" type="datetime-local" required /></label>
+          <label>Total marks<input name="maxMarks" type="number" min="0.5" max="1000" step="0.5" defaultValue="10" required /></label>
+          <button className="button button-primary" disabled={busy || !subjects.length}>{busy ? 'Creating…' : 'Create assignment'}</button>
+          {!subjects.length && <small className="builder-note">Ask the administrator to assign a subject to your teacher account first.</small>}
+        </form>
+        <section className="assignment-list-panel">
+          <div className="table-heading"><div><h3>Your assignments</h3><p>{assignments.length} assignments</p></div></div>
+          {loading ? <div className="empty-inline">Loading assignments…</div> : assignments.length ? <div className="assignment-list">{assignments.map(assignment => <article className="assignment-card" key={assignment._id}>
+            <div className="assignment-card-head"><div><span className="subject-pill">{assignment.subjectId?.code || 'SUBJECT'}</span><h4>{assignment.title}</h4></div><span className="assignment-marks">{assignment.maxMarks} marks</span></div>
+            {assignment.description && <p>{assignment.description}</p>}
+            <small>Due {new Date(assignment.dueAt).toLocaleString()}</small>
+            <div className="assignment-card-actions"><span>{assignment.submissionCount || 0} submitted · {assignment.reviewedCount || 0} reviewed</span><button className="button button-ghost button-small" onClick={() => { setSubmissions([]); setSelectedAssignmentId(current => current === assignment._id ? '' : assignment._id) }}>{selectedAssignmentId === assignment._id ? 'Close submissions' : 'Review submissions'}</button></div>
+            {selectedAssignmentId === assignment._id && <div className="assignment-submissions">
+              {submissions.length ? submissions.map(submission => <article className="assignment-submission" key={submission._id}>
+                <div className="assignment-submission-head"><div><strong>{submission.studentId?.name || 'Student'}</strong><small>{submission.studentId?.email}</small><small>Submitted {new Date(submission.submittedAt).toLocaleString()}</small></div><button className="table-link" onClick={() => void downloadSubmission(assignment._id, submission)}>Download {submission.fileName}</button></div>
+                <form className="assignment-review-form" onSubmit={event => void reviewSubmission(event, assignment._id, submission._id)}>
+                  <label>Marks (out of {assignment.maxMarks})<input name="marks" type="number" min="0" max={assignment.maxMarks} step="0.5" defaultValue={submission.marks ?? ''} required /></label>
+                  <label>Feedback<textarea name="feedback" rows={2} maxLength={5000} defaultValue={submission.feedback || ''} placeholder="Comments for the student…" /></label>
+                  <button className="button button-primary button-small" disabled={reviewingId === submission._id}>{reviewingId === submission._id ? 'Saving…' : 'Save review'}</button>
+                  {submission.reviewedAt && <small>Reviewed {new Date(submission.reviewedAt).toLocaleString()}</small>}
+                </form>
+              </article>) : <div className="empty-inline">No student submissions yet.</div>}
+            </div>}
+          </article>)}</div> : <EmptyState title="No assignments yet" text="Create an assignment to start collecting student work." />}
+        </section>
+      </div>
+    </>
+  }
+
+  return <>
+    <PageHeading eyebrow="COURSEWORK" title="Assignments" description="Upload your work before the deadline and check back for your teacher’s review." />
+    {loading ? <div className="loading-line"><span className="spinner" /> Loading assignments…</div> : assignments.length ? <div className="student-assignment-list">{assignments.map(assignment => {
+      const submission = assignment.submission
+      const isPastDue = Boolean(assignment.isPastDue)
+      const reviewed = Boolean(submission?.reviewedAt)
+      return <article className="assignment-card student-assignment-card" key={assignment._id}>
+        <div className="assignment-card-head"><div><span className="subject-pill">{assignment.subjectId?.code || 'SUBJECT'}</span><h3>{assignment.title}</h3></div><span className="assignment-marks">{assignment.maxMarks} marks</span></div>
+        <p>{assignment.description || 'Submit your completed assignment as a PDF or JPG file.'}</p>
+        <div className="student-assignment-meta"><span>Teacher: {assignment.teacherId?.name || 'Teacher'}</span><span>Due {new Date(assignment.dueAt).toLocaleString()}</span></div>
+        {submission && <div className="assignment-submission-status">
+          <span>Submitted: {submission.fileName} · {new Date(submission.submittedAt).toLocaleString()}</span>
+          <button className="table-link" onClick={() => void downloadSubmission(assignment._id, submission)}>Download your file</button>
+          {reviewed && <div className="assignment-feedback"><strong>Teacher review: {submission.marks} / {assignment.maxMarks}</strong><p>{submission.feedback || 'No written feedback was added.'}</p></div>}
+          {submission && !reviewed && <small>Your submission is waiting for teacher review.</small>}
+        </div>}
+        {!reviewed && !isPastDue
+          ? <form className="assignment-upload-form" onSubmit={event => void submitAssignment(event, assignment)}>
+            <label>Upload PDF or JPG (max 5 MB)<input name="file" type="file" accept=".pdf,.jpg,.jpeg,application/pdf,image/jpeg" required /></label>
+            <button className="button button-primary" disabled={busy}>{busy ? 'Submitting…' : submission ? 'Replace submission' : 'Submit assignment'}</button>
+          </form>
+          : !submission && <span className="result-badge pending">Deadline passed</span>}
+      </article>
+    })}</div> : <EmptyState title="No assignments available" text="Assignments for your subjects will appear here." />}
+  </>
+}
+
+function QuizBattlePage({ user, quizzes, onNotice, onError }: Parameters<typeof PageContent>[0]) {
+  const [battles, setBattles] = useState<QuizBattle[]>([])
+  const [selectedBattle, setSelectedBattle] = useState<QuizBattle | null>(null)
+  const [eligibleStudents, setEligibleStudents] = useState<{ _id: string; name: string }[]>([])
+  const [quizId, setQuizId] = useState('')
+  const [format, setFormat] = useState<'individual' | 'team'>('individual')
+  const [teams, setTeams] = useState([{ name: 'Player 1', memberIds: [] as string[] }, { name: 'Player 2', memberIds: [] as string[] }])
+  const [loading, setLoading] = useState(true)
+  const [creating, setCreating] = useState(false)
+  const [submittingAnswer, setSubmittingAnswer] = useState('')
+  const [now, setNow] = useState(0)
+  const selectedBattleId = selectedBattle?._id
+  const selectedBattleStatus = selectedBattle?.status
+
+  const refreshBattles = useCallback(async () => {
+    try {
+      const nextBattles = await api<QuizBattle[]>('/battles')
+      setBattles(nextBattles)
+      setSelectedBattle(current => current ? nextBattles.find(battle => battle._id === current._id) || current : null)
+    } catch (error) {
+      onError(getError(error))
+    } finally {
+      setLoading(false)
+    }
+  }, [onError])
+
+  useEffect(() => {
+    const initialRefresh = window.setTimeout(() => void refreshBattles(), 0)
+    const interval = window.setInterval(() => void refreshBattles(), 10_000)
+    return () => {
+      window.clearTimeout(initialRefresh)
+      window.clearInterval(interval)
+    }
+  }, [refreshBattles])
+
+  useEffect(() => {
+    if (!quizId) return
+    let active = true
+    api<{ _id: string; name: string }[]>(`/battles/eligible-students?quizId=${encodeURIComponent(quizId)}`)
+      .then(students => { if (active) setEligibleStudents(students) })
+      .catch(error => { if (active) onError(getError(error)) })
+    return () => { active = false }
+  }, [onError, quizId])
+
+  useEffect(() => {
+    if (!selectedBattleId) return
+    let active = true
+    const refreshSelected = async () => {
+      try {
+        const battle = await api<QuizBattle>(`/battles/${selectedBattleId}`)
+        if (active) {
+          setSelectedBattle(battle)
+          setNow(Date.now())
+          setBattles(current => current.map(item => item._id === battle._id ? battle : item))
+        }
+      } catch (error) {
+        if (active) onError(getError(error))
+      }
+    }
+    void refreshSelected()
+    const interval = window.setInterval(() => void refreshSelected(), 2_000)
+    return () => {
+      active = false
+      window.clearInterval(interval)
+    }
+  }, [onError, selectedBattleId])
+
+  useEffect(() => {
+    if (selectedBattleStatus !== 'active') return
+    const interval = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(interval)
+  }, [selectedBattleStatus])
+
+  function updateTeam(index: number, update: Partial<(typeof teams)[number]>) {
+    setTeams(current => current.map((team, teamIndex) => teamIndex === index ? { ...team, ...update } : team))
+  }
+
+  async function createBattle(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setCreating(true)
+    try {
+      const battle = await api<QuizBattle>('/battles', {
+        method: 'POST',
+        body: JSON.stringify({ quizId, format, teams }),
+      })
+      setSelectedBattle(battle)
+      setNow(Date.now())
+      setBattles(current => [battle, ...current.filter(item => item._id !== battle._id)])
+      onNotice('Quiz battle created. Share the selected players and ask everyone to get ready.')
+    } catch (error) {
+      onError(getError(error))
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  async function markReady() {
+    if (!selectedBattle) return
+    try {
+      const battle = await api<QuizBattle>(`/battles/${selectedBattle._id}/ready`, { method: 'POST' })
+      setSelectedBattle(battle)
+      setNow(Date.now())
+      setBattles(current => current.map(item => item._id === battle._id ? battle : item))
+    } catch (error) {
+      onError(getError(error))
+      await refreshBattles()
+    }
+  }
+
+  async function submitAnswer(questionId: string, selectedOption: number) {
+    if (!selectedBattle) return
+    setSubmittingAnswer(questionId)
+    try {
+      const battle = await api<QuizBattle>(`/battles/${selectedBattle._id}/answers`, {
+        method: 'POST',
+        body: JSON.stringify({ questionId, selectedOption }),
+      })
+      setSelectedBattle(battle)
+      setBattles(current => current.map(item => item._id === battle._id ? battle : item))
+    } catch (error) {
+      onError(getError(error))
+      try {
+        setSelectedBattle(await api<QuizBattle>(`/battles/${selectedBattle._id}`))
+      } catch (refreshError) {
+        onError(getError(refreshError))
+      }
+    } finally {
+      setSubmittingAnswer('')
+    }
+  }
+
+  const publishedQuizzes = quizzes.filter(quiz => quiz.status === 'published')
+  const remainingSeconds = selectedBattle?.expiresAt
+    ? Math.max(0, Math.ceil((new Date(selectedBattle.expiresAt).getTime() - now) / 1000))
+    : 0
+
+  return <>
+    <PageHeading eyebrow="LIVE CHALLENGE" title="Quiz battle" description="Choose a quiz, build two sides, and race to answer each round correctly." />
+    <div className="battle-layout">
+      <form className="subject-form battle-create-form" onSubmit={event => void createBattle(event)}>
+        <div className="form-section-title"><span>⚔</span><div><h3>Create a battle</h3><p>Both sides compete on the same quiz questions.</p></div></div>
+        <label>Published quiz<select value={quizId} onChange={event => { setQuizId(event.target.value); setEligibleStudents([]) }} required><option value="" disabled>Select a quiz</option>{publishedQuizzes.map(quiz => <option key={quiz._id} value={quiz._id}>{quiz.title}</option>)}</select></label>
+        <label>Battle type<select value={format} onChange={event => {
+          const nextFormat = event.target.value as typeof format
+          setFormat(nextFormat)
+          setTeams([{ name: nextFormat === 'team' ? 'Team 1' : 'Player 1', memberIds: [] }, { name: nextFormat === 'team' ? 'Team 2' : 'Player 2', memberIds: [] }])
+        }}><option value="individual">Two students</option><option value="team">Two teams (2–5 students each)</option></select></label>
+        {teams.map((team, index) => <fieldset className="battle-side-form" key={`${format}-${index}`}>
+          <legend>{format === 'team' ? `Side ${index + 1}` : `Player ${index + 1}`}</legend>
+          {format === 'team' && <label>Team name<input value={team.name} maxLength={40} onChange={event => updateTeam(index, { name: event.target.value })} required /></label>}
+          <label>{format === 'team' ? 'Team members' : 'Choose a student'}
+            <select
+              multiple={format === 'team'}
+              size={format === 'team' ? Math.min(5, Math.max(2, eligibleStudents.length)) : undefined}
+              value={team.memberIds}
+              onChange={event => updateTeam(index, {
+                memberIds: format === 'team'
+                  ? Array.from(event.currentTarget.selectedOptions, option => option.value)
+                  : event.currentTarget.value ? [event.currentTarget.value] : [],
+              })}
+              required
+            >
+              {eligibleStudents.map(student => <option key={student._id} value={student._id}>{student.name}{student._id === user._id ? ' (you)' : ''}</option>)}
+            </select>
+          </label>
+        </fieldset>)}
+        <small className="builder-note">{format === 'team' ? 'Select 2–5 students per side. A side gets one answer per question.' : 'Each student may be on only one side.'}</small>
+        <button className="button button-primary" disabled={creating || !publishedQuizzes.length || !eligibleStudents.length}>{creating ? 'Creating…' : 'Create quiz battle'}</button>
+        {!publishedQuizzes.length && <small className="builder-note">{user.role === 'teacher' ? 'Publish a quiz first to create a battle.' : 'No published quizzes are available to your account.'}</small>}
+      </form>
+      <section className="battle-list-panel">
+        <div className="table-heading"><div><h3>Your battles</h3><p>Battles you joined{user.role === 'teacher' ? ' or that use your quizzes' : ''} appear here.</p></div><button className="table-link" onClick={() => void refreshBattles()}>Refresh</button></div>
+        {loading ? <div className="empty-inline">Loading battles…</div> : battles.length ? <div className="battle-list">
+          {battles.map(battle => <button type="button" className={`battle-list-item${selectedBattle?._id === battle._id ? ' selected' : ''}`} key={battle._id} onClick={() => { setSelectedBattle(battle); setNow(Date.now()) }}>
+            <span className="battle-list-icon">⚔</span><span><strong>{battle.quizTitle}</strong><small>{battle.teams.map(team => team.name).join(' vs ')}</small></span><span className={`result-badge ${battle.status === 'completed' ? 'passed' : 'pending'}`}>{capitalize(battle.status)}</span>
+          </button>)}
+        </div> : <EmptyState title="No battles yet" text="Create a battle and select the two students or teams who will compete." />}
+      </section>
+    </div>
+    {selectedBattle && <section className="battle-arena">
+      <div className="battle-arena-heading"><div><span className="eyebrow">BATTLE ARENA</span><h2>{selectedBattle.quizTitle}</h2><p>{selectedBattle.format === 'team' ? 'Team battle' : 'One-on-one'} · {selectedBattle.durationMinutes} minute limit</p></div>
+        {selectedBattle.status === 'active' && <div className="battle-timer"><small>TIME LEFT</small><strong>{Math.floor(remainingSeconds / 60)}:{String(remainingSeconds % 60).padStart(2, '0')}</strong></div>}
+      </div>
+      <div className="battle-scoreboard">{selectedBattle.teams.map((team, index) => <div className={`battle-score-side${selectedBattle.winningSideIndex === index ? ' winner' : ''}`} key={`${team.name}-${index}`}><span>{index === 0 ? 'SIDE A' : 'SIDE B'}</span><strong>{team.name}</strong><small>{team.members.map(member => member.name).join(', ')}</small><b>{team.score}</b></div>)}</div>
+      {selectedBattle.status === 'waiting' && <div className="battle-waiting">
+        <div><h3>Waiting for everyone to be ready</h3><p>{selectedBattle.readyCount} of {selectedBattle.participantCount} players ready. The timer starts when all players confirm.</p></div>
+        {selectedBattle.isParticipant && <button className="button button-primary" disabled={selectedBattle.isReady} onClick={() => void markReady()}>{selectedBattle.isReady ? 'You’re ready ✓' : 'I’m ready'}</button>}
+      </div>}
+      {selectedBattle.status === 'active' && <div className="battle-questions">
+        {selectedBattle.questions.map((question, index) => {
+          const winner = selectedBattle.winners.find(item => item.questionId === question.questionId)
+          const answeredSides = selectedBattle.answeredSideIndexes[question.questionId] || []
+          const roundComplete = Boolean(winner) || answeredSides.length === 2
+          const mySideAnswered = selectedBattle.mySideIndex !== null && answeredSides.includes(selectedBattle.mySideIndex)
+          const isParticipant = selectedBattle.isParticipant && selectedBattle.mySideIndex !== null
+          const locked = roundComplete || mySideAnswered || !isParticipant
+          return <article className="battle-question-card" key={question.questionId}>
+            <div className="battle-question-head"><span>ROUND {index + 1}</span>{winner ? <strong>{selectedBattle.teams[winner.sideIndex].name} scored first</strong> : roundComplete ? <strong>Both sides missed</strong> : <small>{answeredSides.length} / 2 sides answered</small>}</div>
+            <h3>{question.prompt}</h3>
+            <div className="battle-answer-options">{question.options.map((option, optionIndex) => <button key={`${question.questionId}-${optionIndex}`} disabled={locked || submittingAnswer === question.questionId} onClick={() => void submitAnswer(question.questionId, optionIndex)}>{String.fromCharCode(65 + optionIndex)}. {option}</button>)}</div>
+            {mySideAnswered && !winner && <small className="battle-feedback">Your side has answered. Waiting for the other side…</small>}
+            {roundComplete && <small className="battle-feedback">{winner ? 'Round complete · +1 point' : 'Round complete · no points awarded'}</small>}
+          </article>
+        })}
+      </div>}
+      {selectedBattle.status === 'completed' && <div className={`battle-result ${selectedBattle.isDraw ? 'draw' : ''}`}>
+        <span>{selectedBattle.isDraw ? '🤝' : '🏆'}</span><div><strong>{selectedBattle.isDraw ? 'It’s a draw!' : `${selectedBattle.teams[selectedBattle.winningSideIndex!].name} wins!`}</strong><small>{selectedBattle.teams[0].score} – {selectedBattle.teams[1].score} · Battle complete</small></div>
+      </div>}
+    </section>}
+  </>
+}
+
+function WeeklyLeaderboardPage({ user, onError }: Parameters<typeof PageContent>[0]) {
+  const [leaderboard, setLeaderboard] = useState<WeeklyLeaderboard | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    api<WeeklyLeaderboard>('/leaderboard/weekly')
+      .then(setLeaderboard)
+      .catch(error => onError(getError(error)))
+      .finally(() => setLoading(false))
+  }, [onError])
+
+  const ownStanding = leaderboard?.students.find(student => student.studentId === user._id)
+  const dateFormatter = new Intl.DateTimeFormat('en', {
+    timeZone: 'Asia/Karachi',
+    month: 'short',
+    day: 'numeric',
+  })
+  const weekEndDate = leaderboard ? new Date(new Date(leaderboard.weekEnd).getTime() - 1) : null
+
+  return <>
+    <PageHeading eyebrow="WEEKLY PROGRESS" title="Student leaderboard" description="See how you stand among your classmates based on this week’s quiz performance." />
+    {ownStanding && <div className="leaderboard-summary">
+      <div><span>Your rank</span><strong>{ownStanding.rank ? `#${ownStanding.rank}` : '—'}</strong></div>
+      <div><span>Weekly average</span><strong>{ownStanding.averagePercentage === null ? '—' : `${ownStanding.averagePercentage}%`}</strong></div>
+      <div><span>Quizzes completed</span><strong>{ownStanding.completedQuizCount}</strong></div>
+    </div>}
+    <section className="table-card leaderboard-card">
+      <div className="table-heading"><div><h3>This week’s rankings</h3><p>{leaderboard && weekEndDate ? `${dateFormatter.format(new Date(leaderboard.weekStart))} – ${dateFormatter.format(weekEndDate)} · Resets every Monday at 12:00 AM Karachi time` : 'Ranked by each student’s best percentage per quiz, averaged for the week.'}</p></div></div>
+      {loading ? <div className="empty-inline">Loading weekly rankings…</div> : leaderboard?.students.length ? <div className="table-scroll"><table><thead><tr><th>Rank</th><th>Student</th><th>Weekly average</th><th>Quizzes completed</th></tr></thead><tbody>{leaderboard.students.map(student => <tr className={student.studentId === user._id ? 'leaderboard-own-row' : ''} key={student.studentId}><td>{student.rank ? <strong>#{student.rank}</strong> : '—'}</td><td><strong>{student.name}{student.studentId === user._id ? ' (you)' : ''}</strong></td><td>{student.averagePercentage === null ? '—' : `${student.averagePercentage}%`}</td><td>{student.completedQuizCount}</td></tr>)}</tbody></table></div> : <EmptyState title="No students to rank yet" text="Student accounts will appear here once they are active." />}
+    </section>
+    <p className="leaderboard-privacy-note">Only weekly averages and quiz counts are shown. Individual quiz marks are private.</p>
   </>
 }
 

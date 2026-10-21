@@ -9,7 +9,7 @@ import mongoose from 'mongoose'
 import helmet from 'helmet'
 import { rateLimit } from 'express-rate-limit'
 import { authenticate, allow } from './auth.js'
-import { Attempt, QuestionBank, Quiz, Subject, User } from './models.js'
+import { Assignment, AssignmentSubmission, Attempt, QuestionBank, Quiz, QuizBattle, Subject, User } from './models.js'
 
 const app = express()
 const port = Number(process.env.PORT || 4000)
@@ -276,6 +276,110 @@ app.post('/api/question-bank', authenticate, allow('teacher'), async (req, res, 
   }
 })
 
+app.post('/api/ai/generate-questions', authenticate, allow('teacher'), rateLimit({
+  windowMs: 60 * 60_000,
+  limit: 10,
+  message: { message: 'AI generation limit reached. Please try again later.' },
+}), async (req, res, next) => {
+  try {
+    const { subjectId, topic = '', difficulty = 'medium', questionType = 'multiple-choice', count = 3 } = req.body
+    if (!mongoose.isValidObjectId(subjectId)
+      || !['easy', 'medium', 'hard'].includes(difficulty)
+      || !['multiple-choice', 'true-false'].includes(questionType)
+      || !Number.isInteger(count) || count < 1 || count > 5
+      || typeof topic !== 'string' || topic.length > 120) {
+      return res.status(400).json({ message: 'Choose a valid subject, difficulty, question type and 1–5 questions.' })
+    }
+    const subject = await Subject.findById(subjectId).select('name')
+    if (!subject) return res.status(400).json({ message: 'Choose a valid subject.' })
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({ message: 'AI generation is not configured yet. Add GEMINI_API_KEY in the hosting settings.' })
+    }
+
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(30_000),
+      body: JSON.stringify({
+        contents: [{
+          parts: [{
+            text: `Create ${count} original ${difficulty} ${questionType === 'true-false' ? 'true/false' : 'multiple-choice'} questions for the subject "${subject.name}"${topic.trim() ? `, about "${topic.trim()}"` : ''}. Keep questions appropriate for classroom assessment. Avoid ambiguity, make exactly one answer correct, and do not include explanations. For multiple choice, provide exactly four distinct options. For true/false, options must be exactly ["True", "False"]. Return only the requested structured data.`,
+          }],
+        }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'OBJECT',
+            properties: {
+              questions: {
+                type: 'ARRAY',
+                items: {
+                  type: 'OBJECT',
+                  properties: {
+                    prompt: { type: 'STRING' },
+                    options: { type: 'ARRAY', items: { type: 'STRING' } },
+                    correctOption: { type: 'INTEGER' },
+                  },
+                  required: ['prompt', 'options', 'correctOption'],
+                },
+              },
+            },
+            required: ['questions'],
+          },
+        },
+      }),
+    })
+
+    if (!response.ok) {
+      if (response.status === 429) return res.status(429).json({ message: 'Gemini is busy or its free quota is temporarily limited. Please try again later.' })
+      if (response.status === 401 || response.status === 403) {
+        console.error('Gemini API authentication failed. Check GEMINI_API_KEY in hosting settings.')
+        return res.status(503).json({ message: 'AI generation is not configured correctly. Please contact the administrator.' })
+      }
+      console.error(`Gemini API request failed with status ${response.status}.`)
+      return res.status(502).json({ message: 'Gemini could not generate questions right now. Please try again.' })
+    }
+
+    const result = await response.json()
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text
+    let generated
+    try {
+      generated = JSON.parse(text)
+    } catch {
+      return res.status(502).json({ message: 'Gemini returned an invalid question format. Please try again.' })
+    }
+    const questions = generated?.questions
+    const optionsCount = questionType === 'true-false' ? 2 : 4
+    if (!Array.isArray(questions) || questions.length !== count || questions.some(question =>
+      typeof question.prompt !== 'string' || !question.prompt.trim()
+      || !Array.isArray(question.options) || question.options.length !== optionsCount
+      || question.options.some(option => typeof option !== 'string' || !option.trim())
+      || new Set(question.options.map(option => option.trim().toLowerCase())).size !== optionsCount
+      || !Number.isInteger(question.correctOption) || question.correctOption < 0 || question.correctOption >= optionsCount
+      || (questionType === 'true-false' && (question.options[0].trim() !== 'True' || question.options[1].trim() !== 'False'))
+    )) {
+      return res.status(502).json({ message: 'Gemini returned incomplete or invalid questions. Please try again.' })
+    }
+
+    res.json({
+      questions: questions.map(question => ({
+        prompt: question.prompt.trim(),
+        options: question.options.map(option => option.trim()),
+        correctOption: question.correctOption,
+        subjectId,
+        topic: topic.trim(),
+        difficulty,
+        questionType,
+      })),
+    })
+  } catch (error) {
+    if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+      return res.status(504).json({ message: 'Gemini took too long to respond. Please try again.' })
+    }
+    next(error)
+  }
+})
+
 app.patch('/api/question-bank/:id', authenticate, allow('teacher', 'admin'), async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid question.' })
@@ -301,6 +405,492 @@ app.delete('/api/question-bank/:id', authenticate, allow('teacher', 'admin'), as
     const removed = await QuestionBank.findOneAndDelete(filter)
     if (!removed) return res.status(404).json({ message: 'Question not found.' })
     res.status(204).end()
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/assignments', authenticate, allow('teacher', 'student'), async (req, res, next) => {
+  try {
+    if (req.user.role === 'teacher') {
+      const assignments = await Assignment.find({ teacherId: req.user._id })
+        .populate('subjectId', 'name code')
+        .sort({ createdAt: -1 })
+      const submissions = await AssignmentSubmission.aggregate([
+        { $match: { assignmentId: { $in: assignments.map(assignment => assignment._id) } } },
+        { $group: { _id: '$assignmentId', count: { $sum: 1 }, reviewed: { $sum: { $cond: [{ $ne: ['$reviewedAt', null] }, 1, 0] } } } },
+      ])
+      const counts = new Map(submissions.map(item => [String(item._id), { count: item.count, reviewed: item.reviewed }]))
+      return res.json(assignments.map(assignment => ({
+        ...assignment.toObject(),
+        submissionCount: counts.get(String(assignment._id))?.count || 0,
+        reviewedCount: counts.get(String(assignment._id))?.reviewed || 0,
+      })))
+    }
+
+    const assignments = await Assignment.find({ subjectId: { $in: req.user.subjectIds || [] } })
+      .populate('subjectId', 'name code')
+      .populate('teacherId', 'name')
+      .sort({ dueAt: 1 })
+    const submissions = await AssignmentSubmission.find({
+      assignmentId: { $in: assignments.map(assignment => assignment._id) },
+      studentId: req.user._id,
+    }).select('-fileData')
+    const byAssignment = new Map(submissions.map(submission => [String(submission.assignmentId), submission]))
+    res.json(assignments.map(assignment => {
+      const submission = byAssignment.get(String(assignment._id))
+      const value = assignment.toObject()
+      if (submission) {
+        value.submission = {
+          _id: submission._id,
+          fileName: submission.fileName,
+          submittedAt: submission.submittedAt,
+          reviewedAt: submission.reviewedAt,
+          marks: submission.reviewedAt ? submission.marks : null,
+          feedback: submission.reviewedAt ? submission.feedback : '',
+        }
+      }
+      value.isPastDue = Date.now() > assignment.dueAt.getTime()
+      return value
+    }))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/assignments', authenticate, allow('teacher'), async (req, res, next) => {
+  try {
+    const { title, description = '', subjectId, dueAt, maxMarks } = req.body
+    const dueDate = new Date(dueAt)
+    if (typeof title !== 'string' || !title.trim() || title.trim().length > 160
+      || typeof description !== 'string' || description.length > 5000
+      || !mongoose.isValidObjectId(subjectId) || Number.isNaN(dueDate.getTime())
+      || !Number.isFinite(maxMarks) || maxMarks < 0.5 || maxMarks > 1000) {
+      return res.status(400).json({ message: 'Enter an assignment title, subject, due date and total marks (0.5–1000).' })
+    }
+    if (!await Subject.exists({ _id: subjectId })) return res.status(400).json({ message: 'Choose a valid subject.' })
+    const assignment = await Assignment.create({
+      title: title.trim(),
+      description: description.trim(),
+      subjectId,
+      teacherId: req.user._id,
+      dueAt: dueDate,
+      maxMarks,
+    })
+    res.status(201).json(await assignment.populate('subjectId', 'name code'))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/assignments/:id/submissions', authenticate, allow('teacher'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid assignment.' })
+    const assignment = await Assignment.findOne({ _id: req.params.id, teacherId: req.user._id })
+    if (!assignment) return res.status(404).json({ message: 'Assignment not found.' })
+    const submissions = await AssignmentSubmission.find({ assignmentId: assignment._id })
+      .select('-fileData')
+      .populate('studentId', 'name email')
+      .sort({ submittedAt: -1 })
+    res.json({ assignment, submissions })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/assignments/:id/submissions', authenticate, allow('student'), express.raw({
+  type: ['application/pdf', 'image/jpeg'],
+  limit: '5mb',
+}), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid assignment.' })
+    const assignment = await Assignment.findById(req.params.id)
+    if (!assignment || !req.user.subjectIds.some(id => String(id) === String(assignment.subjectId))) {
+      return res.status(404).json({ message: 'Assignment not found.' })
+    }
+    if (new Date() > assignment.dueAt) return res.status(409).json({ message: 'The assignment deadline has passed.' })
+    const existing = await AssignmentSubmission.findOne({ assignmentId: assignment._id, studentId: req.user._id })
+    if (existing?.reviewedAt) return res.status(409).json({ message: 'This submission has already been reviewed. Contact your teacher if you need to resubmit.' })
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({ message: 'Choose a PDF or JPG file to submit.' })
+    }
+
+    const mimeType = req.headers['content-type']
+    const fileNameHeader = req.headers['x-file-name']
+    let fileName
+    try {
+      fileName = decodeURIComponent(String(fileNameHeader || ''))
+    } catch {
+      return res.status(400).json({ message: 'Invalid file name.' })
+    }
+    fileName = path.basename(fileName.replace(/\\/g, '/')).replace(/[\r\n"]/g, '').trim()
+    const isPdf = mimeType === 'application/pdf'
+      && fileName.toLowerCase().endsWith('.pdf')
+      && req.body.subarray(0, 5).toString('ascii') === '%PDF-'
+    const isJpeg = mimeType === 'image/jpeg'
+      && /\.(jpe?g)$/i.test(fileName)
+      && req.body[0] === 0xff && req.body[1] === 0xd8 && req.body[2] === 0xff
+    if ((!isPdf && !isJpeg) || !fileName || fileName.length > 180) {
+      return res.status(400).json({ message: 'Only valid PDF and JPG files up to 5 MB are accepted.' })
+    }
+
+    const submission = existing || new AssignmentSubmission({ assignmentId: assignment._id, studentId: req.user._id })
+    submission.fileName = fileName
+    submission.fileMimeType = mimeType
+    submission.fileData = req.body
+    submission.submittedAt = new Date()
+    submission.marks = null
+    submission.feedback = ''
+    submission.reviewedAt = null
+    await submission.save()
+    res.status(existing ? 200 : 201).json({
+      _id: submission._id,
+      fileName: submission.fileName,
+      submittedAt: submission.submittedAt,
+      reviewedAt: null,
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/assignments/:id/submissions/:submissionId/review', authenticate, allow('teacher'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id) || !mongoose.isValidObjectId(req.params.submissionId)) {
+      return res.status(400).json({ message: 'Invalid assignment submission.' })
+    }
+    const assignment = await Assignment.findOne({ _id: req.params.id, teacherId: req.user._id })
+    if (!assignment) return res.status(404).json({ message: 'Assignment not found.' })
+    const { marks, feedback = '' } = req.body
+    if (!Number.isFinite(marks) || marks < 0 || marks > assignment.maxMarks
+      || typeof feedback !== 'string' || feedback.length > 5000) {
+      return res.status(400).json({ message: `Enter marks from 0 to ${assignment.maxMarks} and feedback under 5000 characters.` })
+    }
+    const submission = await AssignmentSubmission.findOne({
+      _id: req.params.submissionId,
+      assignmentId: assignment._id,
+    })
+    if (!submission) return res.status(404).json({ message: 'Submission not found.' })
+    submission.marks = marks
+    submission.feedback = feedback.trim()
+    submission.reviewedAt = new Date()
+    await submission.save()
+    res.json({
+      _id: submission._id,
+      marks: submission.marks,
+      feedback: submission.feedback,
+      reviewedAt: submission.reviewedAt,
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/assignments/:id/submissions/:submissionId/file', authenticate, allow('teacher', 'student'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id) || !mongoose.isValidObjectId(req.params.submissionId)) {
+      return res.status(400).json({ message: 'Invalid assignment submission.' })
+    }
+    const submission = await AssignmentSubmission.findOne({
+      _id: req.params.submissionId,
+      assignmentId: req.params.id,
+      ...(req.user.role === 'student' ? { studentId: req.user._id } : {}),
+    }).select('+fileData')
+    if (!submission) return res.status(404).json({ message: 'Submission file not found.' })
+    if (req.user.role === 'teacher' && !await Assignment.exists({ _id: req.params.id, teacherId: req.user._id })) {
+      return res.status(404).json({ message: 'Submission file not found.' })
+    }
+    res.set({
+      'Content-Type': submission.fileMimeType,
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(submission.fileName)}`,
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'private, no-store',
+    }).send(submission.fileData)
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/battles/eligible-students', authenticate, allow('teacher', 'student'), async (req, res, next) => {
+  try {
+    const { quizId } = req.query
+    if (!mongoose.isValidObjectId(quizId)) return res.status(400).json({ message: 'Choose a valid quiz.' })
+    const quiz = await Quiz.findOne({ _id: quizId, status: 'published' })
+    if (!quiz) return res.status(404).json({ message: 'Published quiz not found.' })
+    if (req.user.role === 'teacher' && String(quiz.teacherId) !== String(req.user._id)) {
+      return res.status(404).json({ message: 'Quiz not found.' })
+    }
+    if (req.user.role === 'student' && !studentCanAccessQuiz(quiz, req.user)) {
+      return res.status(403).json({ message: 'This quiz is not available to your account.' })
+    }
+
+    const students = await User.find({
+      role: 'student',
+      active: true,
+      $or: [
+        { subjectIds: quiz.subjectId },
+        { _id: { $in: quiz.assignedStudentIds } },
+      ],
+    }).select('name').sort({ name: 1 })
+    res.json(students.map(student => ({ _id: student._id, name: student.name })))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/battles', authenticate, allow('teacher', 'student'), async (req, res, next) => {
+  try {
+    const filter = req.user.role === 'teacher'
+      ? { teacherId: req.user._id }
+      : { 'participants.userId': req.user._id }
+    const battles = await QuizBattle.find(filter).sort({ createdAt: -1 }).limit(30)
+    res.json(await Promise.all(battles.map(battle => serializeBattle(battle, req.user))))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/battles', authenticate, allow('teacher', 'student'), rateLimit({
+  windowMs: 60 * 60_000,
+  limit: 10,
+  message: { message: 'Battle creation limit reached. Please try again later.' },
+}), async (req, res, next) => {
+  try {
+    const { quizId, format, teams } = req.body
+    if (!mongoose.isValidObjectId(quizId) || !['individual', 'team'].includes(format)
+      || !Array.isArray(teams) || teams.length !== 2) {
+      return res.status(400).json({ message: 'Choose a published quiz and set up two players or two teams.' })
+    }
+    const quiz = await Quiz.findOne({ _id: quizId, status: 'published' })
+    if (!quiz) return res.status(404).json({ message: 'Published quiz not found.' })
+    if (req.user.role === 'teacher' && String(quiz.teacherId) !== String(req.user._id)) {
+      return res.status(404).json({ message: 'Quiz not found.' })
+    }
+    if (req.user.role === 'student' && !studentCanAccessQuiz(quiz, req.user)) {
+      return res.status(403).json({ message: 'This quiz is not available to your account.' })
+    }
+
+    const normalizedTeams = []
+    for (const [index, team] of teams.entries()) {
+      const memberIds = team?.memberIds
+      const minMembers = format === 'team' ? 2 : 1
+      const maxMembers = format === 'team' ? 5 : 1
+      if (typeof team?.name !== 'string' || !team.name.trim() || team.name.trim().length > 40
+        || !Array.isArray(memberIds) || memberIds.length < minMembers || memberIds.length > maxMembers
+        || memberIds.some(id => !mongoose.isValidObjectId(id))) {
+        return res.status(400).json({ message: format === 'team'
+          ? 'Each team must have a name and 2–5 students.'
+          : 'Choose exactly one student for each side.' })
+      }
+      const uniqueMemberIds = [...new Set(memberIds.map(String))]
+      if (uniqueMemberIds.length !== memberIds.length) return res.status(400).json({ message: 'A student cannot be selected more than once on the same side.' })
+      normalizedTeams.push({ name: team.name.trim(), memberIds: uniqueMemberIds, sideIndex: index })
+    }
+
+    const allMemberIds = normalizedTeams.flatMap(team => team.memberIds)
+    if (new Set(allMemberIds).size !== allMemberIds.length) {
+      return res.status(400).json({ message: 'A student cannot be placed on both sides.' })
+    }
+    if (req.user.role === 'student' && !allMemberIds.includes(String(req.user._id))) {
+      return res.status(400).json({ message: 'Include yourself on one side of the battle.' })
+    }
+
+    const students = await User.find({
+      _id: { $in: allMemberIds },
+      role: 'student',
+      active: true,
+    }).select('_id subjectIds')
+    if (students.length !== allMemberIds.length) {
+      return res.status(400).json({ message: 'Every selected player must have an active student account.' })
+    }
+    if (students.some(student => !studentCanAccessQuiz(quiz, student))) {
+      return res.status(400).json({ message: 'All players must be assigned to this quiz or its subject.' })
+    }
+
+    const participants = normalizedTeams.flatMap(team => team.memberIds.map(userId => ({
+      userId,
+      sideIndex: team.sideIndex,
+    })))
+    const battle = await QuizBattle.create({
+      quizId: quiz._id,
+      quizTitle: quiz.title,
+      durationMinutes: quiz.durationMinutes,
+      teacherId: quiz.teacherId,
+      creatorId: req.user._id,
+      creatorRole: req.user.role,
+      format,
+      teams: normalizedTeams.map(({ name, memberIds }) => ({ name, memberIds })),
+      participants,
+      readyUserIds: req.user.role === 'student' ? [req.user._id] : [],
+      questions: quiz.questions.map(question => ({
+        questionId: question._id,
+        prompt: question.prompt,
+        options: question.options,
+        correctOption: question.correctOption,
+      })),
+    })
+    res.status(201).json(await serializeBattle(battle, req.user))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/battles/:id', authenticate, allow('teacher', 'student'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid battle.' })
+    const battle = await QuizBattle.findById(req.params.id)
+    if (!battle || !canViewBattle(battle, req.user)) return res.status(404).json({ message: 'Battle not found.' })
+    res.json(await serializeBattle(battle, req.user))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/battles/:id/ready', authenticate, allow('student'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid battle.' })
+    let battle = await QuizBattle.findOneAndUpdate({
+      _id: req.params.id,
+      status: 'waiting',
+      'participants.userId': req.user._id,
+    }, { $addToSet: { readyUserIds: req.user._id } }, { new: true })
+    if (!battle) {
+      const exists = await QuizBattle.exists({ _id: req.params.id, 'participants.userId': req.user._id })
+      return res.status(exists ? 409 : 404).json({ message: exists ? 'This battle is no longer waiting for players.' : 'Battle not found.' })
+    }
+    if (battle.readyUserIds.length === battle.participants.length) {
+      const startedAt = new Date()
+      const startedBattle = await QuizBattle.findOneAndUpdate({
+        _id: battle._id,
+        status: 'waiting',
+      }, {
+        $set: {
+          status: 'active',
+          startedAt,
+          expiresAt: new Date(startedAt.getTime() + battle.durationMinutes * 60_000),
+        },
+      }, { new: true })
+      battle = startedBattle || await QuizBattle.findById(battle._id)
+    }
+    if (!battle) return res.status(404).json({ message: 'Battle not found.' })
+    res.json(await serializeBattle(battle, req.user))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/battles/:id/answers', authenticate, allow('student'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id) || !mongoose.isValidObjectId(req.body.questionId)) {
+      return res.status(400).json({ message: 'Invalid battle question.' })
+    }
+    const { questionId, selectedOption } = req.body
+    if (!Number.isInteger(selectedOption) || selectedOption < 0) {
+      return res.status(400).json({ message: 'Choose one of the answer options.' })
+    }
+    const battle = await QuizBattle.findOne({
+      _id: req.params.id,
+      status: 'active',
+      expiresAt: { $gt: new Date() },
+      'participants.userId': req.user._id,
+    })
+    if (!battle) return res.status(409).json({ message: 'This battle is not active or has already ended.' })
+    const participant = battle.participants.find(item => String(item.userId) === String(req.user._id))
+    const question = battle.questions.find(item => String(item.questionId) === String(questionId))
+    if (!question || selectedOption >= question.options.length) {
+      return res.status(400).json({ message: 'Choose a valid answer for this battle question.' })
+    }
+    const submittedAt = new Date()
+    const isCorrect = selectedOption === question.correctOption
+    const update = { $push: { answers: {
+      questionId: question.questionId,
+      sideIndex: participant.sideIndex,
+      submittedBy: req.user._id,
+      selectedOption,
+      isCorrect,
+      submittedAt,
+    } } }
+    if (isCorrect) {
+      update.$push.winners = { questionId: question.questionId, sideIndex: participant.sideIndex }
+    }
+    const updatedBattle = await QuizBattle.findOneAndUpdate({
+      _id: battle._id,
+      status: 'active',
+      expiresAt: { $gt: submittedAt },
+      answers: { $not: { $elemMatch: { questionId: question.questionId, sideIndex: participant.sideIndex } } },
+      winners: { $not: { $elemMatch: { questionId: question.questionId } } },
+    }, update, { new: true })
+    if (!updatedBattle) return res.status(409).json({ message: 'Your side has answered this question or another side won it already.' })
+
+    const finishedAllRounds = updatedBattle.questions.every(round => {
+      if (updatedBattle.winners.some(winner => String(winner.questionId) === String(round.questionId))) return true
+      return [0, 1].every(sideIndex => updatedBattle.answers.some(answer =>
+        String(answer.questionId) === String(round.questionId) && answer.sideIndex === sideIndex))
+    })
+    if (finishedAllRounds) {
+      updatedBattle.status = 'completed'
+      updatedBattle.completedAt = new Date()
+      await updatedBattle.save()
+    }
+    res.json(await serializeBattle(updatedBattle, req.user))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/leaderboard/weekly', authenticate, allow('admin', 'teacher', 'student'), async (_req, res, next) => {
+  try {
+    const { start, end } = getKarachiWeekBounds(new Date())
+    const students = await User.find({ role: 'student', active: true }).select('name').sort({ name: 1 })
+    const attempts = await Attempt.find({
+      submittedAt: { $gte: start, $lt: end },
+      obtainedMarks: { $ne: null },
+    }).select('studentId quizId obtainedMarks').populate('quizId', 'questions.marks')
+
+    const bestScoresByStudent = new Map()
+    for (const attempt of attempts) {
+      if (!attempt.quizId || !attempt.studentId) continue
+      const totalMarks = attempt.quizId.questions.reduce((sum, question) => sum + question.marks, 0)
+      if (!totalMarks) continue
+      const studentId = String(attempt.studentId)
+      const quizId = String(attempt.quizId._id)
+      const percentage = Math.max(0, Math.min(100, attempt.obtainedMarks / totalMarks * 100))
+      if (!bestScoresByStudent.has(studentId)) bestScoresByStudent.set(studentId, new Map())
+      const quizScores = bestScoresByStudent.get(studentId)
+      quizScores.set(quizId, Math.max(quizScores.get(quizId) || 0, percentage))
+    }
+
+    const rankedStudents = students.map(student => {
+      const quizScores = bestScoresByStudent.get(String(student._id))
+      const completedQuizCount = quizScores?.size || 0
+      const averagePercentage = completedQuizCount
+        ? Number((Array.from(quizScores.values()).reduce((sum, score) => sum + score, 0) / completedQuizCount).toFixed(2))
+        : null
+      return { studentId: student._id, name: student.name, averagePercentage, completedQuizCount, rank: null }
+    }).sort((first, second) => {
+      if (first.averagePercentage === null) return second.averagePercentage === null ? first.name.localeCompare(second.name) : 1
+      if (second.averagePercentage === null) return -1
+      return second.averagePercentage - first.averagePercentage
+        || second.completedQuizCount - first.completedQuizCount
+        || first.name.localeCompare(second.name)
+    })
+
+    let previousRankKey = ''
+    let previousRank = 0
+    rankedStudents.forEach((student, index) => {
+      if (student.averagePercentage === null) return
+      const rankKey = String(student.averagePercentage)
+      if (rankKey !== previousRankKey) previousRank = index + 1
+      student.rank = previousRank
+      previousRankKey = rankKey
+    })
+
+    res.json({
+      timezone: 'Asia/Karachi',
+      weekStart: start,
+      weekEnd: end,
+      students: rankedStudents,
+    })
   } catch (error) {
     next(error)
   }
@@ -499,6 +1089,9 @@ if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
 }
 
 app.use((error, _req, res, _next) => {
+  if (error.status === 413 || error.code === 'entity.too.large') {
+    return res.status(413).json({ message: 'The uploaded file must be 5 MB or smaller.' })
+  }
   if (error.code === 11000) return res.status(409).json({ message: 'That email or subject code is already in use.' })
   if (error.name === 'ValidationError' || error.name === 'CastError') {
     return res.status(400).json({ message: error.message })
@@ -608,6 +1201,88 @@ function validateBankQuestion(body) {
   }
   if (questionType === 'true-false' && options.length !== 2) return new Error('True/False questions must have exactly two options.')
   return { prompt: prompt.trim(), questionType, options: options.map(option => option.trim()), correctOption, subjectId, topic: String(topic).trim(), difficulty }
+}
+
+function studentCanAccessQuiz(quiz, student) {
+  const explicitlyAssigned = quiz.assignedStudentIds.some(id => String(id) === String(student._id))
+  if (quiz.assignedStudentIds.length && !explicitlyAssigned) return false
+  return explicitlyAssigned || student.subjectIds.some(id => String(id) === String(quiz.subjectId))
+}
+
+function canViewBattle(battle, user) {
+  if (user.role === 'teacher') return String(battle.teacherId) === String(user._id)
+  return battle.participants.some(participant => String(participant.userId) === String(user._id))
+}
+
+async function serializeBattle(battle, user) {
+  if (battle.status === 'active' && battle.expiresAt && battle.expiresAt <= new Date()) {
+    battle.status = 'completed'
+    battle.completedAt = battle.expiresAt
+    await battle.save()
+  }
+
+  const participantIds = battle.participants.map(participant => participant.userId)
+  const users = await User.find({ _id: { $in: participantIds } }).select('name')
+  const usersById = new Map(users.map(participant => [String(participant._id), participant]))
+  const teams = battle.teams.map((team, sideIndex) => ({
+    name: team.name,
+    members: team.memberIds.map(id => {
+      const participant = usersById.get(String(id))
+      return { _id: String(id), name: participant?.name || 'Student' }
+    }),
+    score: battle.winners.filter(winner => winner.sideIndex === sideIndex).length,
+  }))
+  const currentParticipant = battle.participants.find(participant => String(participant.userId) === String(user._id))
+  const answeredSideIndexes = {}
+  for (const answer of battle.answers) {
+    const key = String(answer.questionId)
+    answeredSideIndexes[key] ||= []
+    if (!answeredSideIndexes[key].includes(answer.sideIndex)) answeredSideIndexes[key].push(answer.sideIndex)
+  }
+
+  return {
+    _id: String(battle._id),
+    quizTitle: battle.quizTitle,
+    durationMinutes: battle.durationMinutes,
+    creatorId: String(battle.creatorId),
+    format: battle.format,
+    status: battle.status,
+    teams,
+    questions: battle.status === 'waiting' ? [] : battle.questions.map(question => ({
+      questionId: String(question.questionId),
+      prompt: question.prompt,
+      options: question.options,
+    })),
+    winners: battle.winners.map(winner => ({
+      questionId: String(winner.questionId),
+      sideIndex: winner.sideIndex,
+    })),
+    answeredSideIndexes,
+    readyCount: battle.readyUserIds.length,
+    participantCount: battle.participants.length,
+    isReady: battle.readyUserIds.some(id => String(id) === String(user._id)),
+    isParticipant: Boolean(currentParticipant),
+    mySideIndex: currentParticipant?.sideIndex ?? null,
+    startedAt: battle.startedAt,
+    expiresAt: battle.expiresAt,
+    isDraw: battle.status === 'completed' && teams[0].score === teams[1].score,
+    winningSideIndex: battle.status === 'completed' && teams[0].score !== teams[1].score
+      ? teams[0].score > teams[1].score ? 0 : 1
+      : null,
+  }
+}
+
+function getKarachiWeekBounds(now) {
+  const karachiOffset = 5 * 60 * 60_000
+  const localNow = new Date(now.getTime() + karachiOffset)
+  const daysSinceMonday = (localNow.getUTCDay() + 6) % 7
+  const mondayUtc = Date.UTC(
+    localNow.getUTCFullYear(),
+    localNow.getUTCMonth(),
+    localNow.getUTCDate() - daysSinceMonday,
+  )
+  const start = new Date(mondayUtc - karachiOffset)
+  return { start, end: new Date(start.getTime() + 7 * 24 * 60 * 60_000) }
 }
 
 function shuffle(values) {

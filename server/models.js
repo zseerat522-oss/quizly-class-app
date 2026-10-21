@@ -76,7 +76,85 @@ const attemptSchema = new Schema({
   obtainedMarks: { type: Number, default: null },
 }, { timestamps: true })
 
+const assignmentSchema = new Schema({
+  title: { type: String, required: true, trim: true },
+  description: { type: String, trim: true, default: '' },
+  subjectId: { type: Schema.Types.ObjectId, ref: 'Subject', required: true },
+  teacherId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  dueAt: { type: Date, required: true },
+  maxMarks: { type: Number, required: true, min: 0.5, max: 1000 },
+}, { timestamps: true })
+
+const assignmentSubmissionSchema = new Schema({
+  assignmentId: { type: Schema.Types.ObjectId, ref: 'Assignment', required: true },
+  studentId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  fileName: { type: String, required: true, trim: true },
+  fileMimeType: { type: String, enum: ['application/pdf', 'image/jpeg'], required: true },
+  fileData: { type: Buffer, required: true, select: false },
+  submittedAt: { type: Date, required: true, default: Date.now },
+  marks: { type: Number, default: null, min: 0 },
+  feedback: { type: String, trim: true, default: '' },
+  reviewedAt: { type: Date, default: null },
+}, { timestamps: true })
+
+assignmentSubmissionSchema.index({ assignmentId: 1, studentId: 1 }, { unique: true })
+
+const battleTeamSchema = new Schema({
+  name: { type: String, required: true, trim: true },
+  memberIds: [{ type: Schema.Types.ObjectId, ref: 'User', required: true }],
+}, { _id: false })
+
+const battleParticipantSchema = new Schema({
+  userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  sideIndex: { type: Number, required: true, min: 0, max: 1 },
+}, { _id: false })
+
+const battleQuestionSchema = new Schema({
+  questionId: { type: Schema.Types.ObjectId, required: true },
+  prompt: { type: String, required: true },
+  options: { type: [String], required: true },
+  correctOption: { type: Number, required: true, min: 0 },
+}, { _id: false })
+
+const battleAnswerSchema = new Schema({
+  questionId: { type: Schema.Types.ObjectId, required: true },
+  sideIndex: { type: Number, required: true, min: 0, max: 1 },
+  submittedBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  selectedOption: { type: Number, required: true, min: 0 },
+  isCorrect: { type: Boolean, required: true },
+  submittedAt: { type: Date, required: true },
+}, { _id: false })
+
+const battleWinnerSchema = new Schema({
+  questionId: { type: Schema.Types.ObjectId, required: true },
+  sideIndex: { type: Number, required: true, min: 0, max: 1 },
+}, { _id: false })
+
+const quizBattleSchema = new Schema({
+  quizId: { type: Schema.Types.ObjectId, ref: 'Quiz', required: true },
+  quizTitle: { type: String, required: true },
+  durationMinutes: { type: Number, required: true, min: 1 },
+  teacherId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  creatorId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  creatorRole: { type: String, enum: ['teacher', 'student'], required: true },
+  format: { type: String, enum: ['individual', 'team'], required: true },
+  teams: { type: [battleTeamSchema], required: true, validate: value => value.length === 2 },
+  participants: { type: [battleParticipantSchema], required: true },
+  readyUserIds: [{ type: Schema.Types.ObjectId, ref: 'User' }],
+  questions: { type: [battleQuestionSchema], required: true },
+  answers: { type: [battleAnswerSchema], default: [] },
+  winners: { type: [battleWinnerSchema], default: [] },
+  status: { type: String, enum: ['waiting', 'active', 'completed'], default: 'waiting' },
+  startedAt: { type: Date, default: null },
+  expiresAt: { type: Date, default: null },
+  completedAt: { type: Date, default: null },
+}, { timestamps: true })
+
+quizBattleSchema.index({ 'participants.userId': 1, createdAt: -1 })
+quizBattleSchema.index({ teacherId: 1, createdAt: -1 })
+
 attemptSchema.index({ quizId: 1, studentId: 1, createdAt: -1 })
+attemptSchema.index({ submittedAt: 1, studentId: 1, quizId: 1 })
 attemptSchema.index(
   { quizId: 1, studentId: 1 },
   { unique: true, partialFilterExpression: { submittedAt: null } },
@@ -87,3 +165,6 @@ export const Subject = model('Subject', subjectSchema)
 export const QuestionBank = model('QuestionBank', questionBankSchema)
 export const Quiz = model('Quiz', quizSchema)
 export const Attempt = model('Attempt', attemptSchema)
+export const Assignment = model('Assignment', assignmentSchema)
+export const AssignmentSubmission = model('AssignmentSubmission', assignmentSubmissionSchema)
+export const QuizBattle = model('QuizBattle', quizBattleSchema)
